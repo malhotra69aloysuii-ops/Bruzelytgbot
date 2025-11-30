@@ -1,0 +1,8 @@
+pillow==10.4.0
+pytesseract==0.3.10
+python-telegram-bot==21.10
+selenium-wire==5.1.0
+selenium==4.21.0
+pytz==2024.1
+asyncio==3.4.3
+brotli==1.1.0
