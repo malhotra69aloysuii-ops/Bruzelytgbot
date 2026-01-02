@@ -1,8 +1,6 @@
-pillow==10.4.0
-pytesseract==0.3.10
-python-telegram-bot==21.10
-selenium-wire==5.1.0
-selenium==4.21.0
-pytz==2024.1
-asyncio==3.4.3
-brotli==1.1.0
+telethon==1.37.0
+pysocks==1.7.1
+cryptg==0.4.0
+pyasn1==0.6.0
+pyasn1-modules==0.4.0
+rsa==4.9
