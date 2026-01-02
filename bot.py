@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import re
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -10,27 +11,29 @@ from telethon import TelegramClient, events, Button
 from telethon.tl import types
 from telethon.tl.functions.channels import (
     GetParticipantRequest, 
-    JoinChannelRequest,
-    GetFullChannelRequest
+    JoinChannelRequest
 )
 from telethon.tl.functions.messages import (
-    GetHistoryRequest,
     ImportChatInviteRequest,
     CheckChatInviteRequest
 )
 from telethon.errors import (
-    ChatAdminRequiredError, ChannelPrivateError, 
-    UserNotParticipantError, FloodWaitError,
-    ChatWriteForbiddenError, ChatIdInvalidError,
-    InviteHashExpiredError, InviteHashInvalidError,
-    InviteRequestSentError, UserAlreadyParticipantError,
-    ChannelsTooMuchError, ChatInvalidError
+    ChannelPrivateError, 
+    UserNotParticipantError, 
+    FloodWaitError,
+    ChatWriteForbiddenError, 
+    ChatIdInvalidError,
+    InviteHashExpiredError, 
+    InviteHashInvalidError,
+    InviteRequestSentError, 
+    UserAlreadyParticipantError,
+    ChannelsTooMuchError
 )
 
 # ==================== CONFIGURATION ====================
-API_ID = '34968593'  # Get from https://my.telegram.org
-API_HASH = '07507854a43f550b73d7e2003b688541'  # Get from https://my.telegram.org
-BOT_TOKEN = '8269695320:AAFVvdG5tSjavOcFSusKTg6Y0iUeXU8bOM4'  # Get from @BotFather
+API_ID = os.environ.get('API_ID', '34968593')
+API_HASH = os.environ.get('API_HASH', '07507854a43f550b73d7e2003b688541')
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '8269695320:AAFVvdG5tSjavOcFSusKTg6Y0iUeXU8bOM4')
 
 # Storage files
 DATA_FILE = 'forwarder_data.json'
@@ -72,7 +75,6 @@ class DataManager:
         try:
             with open(self.data_file, 'w', encoding='utf-8') as f:
                 json.dump(self.data, f, indent=2, ensure_ascii=False)
-            logger.info("Data saved successfully")
         except IOError as e:
             logger.error(f"Error saving data: {e}")
     
@@ -125,41 +127,87 @@ class DataManager:
                     self.save_data()
                     break
 
-# ==================== SIMPLIFIED BOT CORE ====================
-class SimpleForwarderBot:
-    """Simplified bot with minimal permission checks - focuses on membership only"""
+# ==================== BOT CORE ====================
+class PrivateChatOnlyBot:
+    """Bot that only works in private chats with no repeated messages"""
     
     def __init__(self, api_id: str, api_hash: str, bot_token: str):
         self.client = TelegramClient(SESSION_FILE, api_id, api_hash)
         self.bot_token = bot_token
         self.data_manager = DataManager()
         self.active_tasks: Dict[int, asyncio.Task] = {}
+        self.message_store: Dict[int, dict] = {}
         
-        # Store message cache to remember forwarded messages
-        self.message_cache: Dict[int, types.Message] = {}
+        # Store last message time per user to prevent repeats
+        self.user_last_message: Dict[int, float] = {}
         
-        # Register event handlers
-        self.client.add_event_handler(self.handle_start, events.NewMessage(pattern='/start'))
-        self.client.add_event_handler(self.handle_cancel, events.NewMessage(pattern='/cancel'))
-        self.client.add_event_handler(self.handle_my_tasks, events.NewMessage(pattern='/mytasks'))
-        self.client.add_event_handler(self.handle_stop_task, events.NewMessage(pattern='/stoptask'))
-        self.client.add_event_handler(self.handle_status, events.NewMessage(pattern='/status'))
-        self.client.add_event_handler(self.handle_help, events.NewMessage(pattern='/help'))
-        self.client.add_event_handler(self.handle_message, events.NewMessage())
+        # Register event handlers with filters
+        self.client.add_event_handler(
+            self.handle_start, 
+            events.NewMessage(pattern='/start', incoming=True, func=self.is_private_chat)
+        )
+        self.client.add_event_handler(
+            self.handle_cancel, 
+            events.NewMessage(pattern='/cancel', incoming=True, func=self.is_private_chat)
+        )
+        self.client.add_event_handler(
+            self.handle_my_tasks, 
+            events.NewMessage(pattern='/mytasks', incoming=True, func=self.is_private_chat)
+        )
+        self.client.add_event_handler(
+            self.handle_stop_task, 
+            events.NewMessage(pattern='/stoptask', incoming=True, func=self.is_private_chat)
+        )
+        self.client.add_event_handler(
+            self.handle_status, 
+            events.NewMessage(pattern='/status', incoming=True, func=self.is_private_chat)
+        )
+        self.client.add_event_handler(
+            self.handle_help, 
+            events.NewMessage(pattern='/help', incoming=True, func=self.is_private_chat)
+        )
+        self.client.add_event_handler(
+            self.handle_message,
+            events.NewMessage(incoming=True, func=self.is_private_chat_and_not_command)
+        )
     
-    # ==================== SIMPLIFIED UTILITY METHODS ====================
+    def is_private_chat(self, event):
+        """Check if message is from private chat"""
+        return event.is_private
+    
+    def is_private_chat_and_not_command(self, event):
+        """Check if message is from private chat and not a command"""
+        if not event.is_private:
+            return False
+        
+        # Check if it's a command
+        if event.raw_text and event.raw_text.startswith('/'):
+            return False
+        
+        # Prevent repeated messages from same user
+        user_id = event.sender_id
+        current_time = datetime.now().timestamp()
+        
+        # Check if user sent a message recently (within 2 seconds)
+        if user_id in self.user_last_message:
+            time_diff = current_time - self.user_last_message[user_id]
+            if time_diff < 2:  # Less than 2 seconds
+                logger.info(f"Ignoring repeated message from user {user_id} within {time_diff:.2f}s")
+                return False
+        
+        # Update last message time
+        self.user_last_message[user_id] = current_time
+        return True
+    
+    # ==================== UTILITY METHODS ====================
     
     async def extract_group_info(self, group_input: str) -> Optional[Tuple[int, str, str]]:
-        """
-        Extract group info from input
-        Returns: (group_id, group_title, invite_hash) or None
-        """
+        """Extract group info from input"""
         try:
             group_input = group_input.strip()
             
-            # Check if it's an invite link (private group)
+            # Check if it's an invite link
             if 't.me/+' in group_input or 't.me/joinchat/' in group_input:
-                # Extract invite hash
                 patterns = [
                     r't\.me/\+([a-zA-Z0-9_-]+)',
                     r't\.me/joinchat/([a-zA-Z0-9_-]+)',
@@ -175,29 +223,23 @@ class SimpleForwarderBot:
                 
                 if invite_hash:
                     try:
-                        # Check the invite
                         invite = await self.client(CheckChatInviteRequest(invite_hash))
-                        
                         if isinstance(invite, types.ChatInvite):
                             return None, invite.title, invite_hash
                         elif isinstance(invite, types.ChatInviteAlready):
                             return invite.chat.id, invite.chat.title, None
-                    
-                    except Exception as e:
-                        logger.error(f"Error checking invite: {e}")
+                    except:
                         return None, None, invite_hash
             
             # Handle regular group/channel link
             elif 't.me/' in group_input:
-                # Extract username from link
                 match = re.search(r't\.me/([a-zA-Z0-9_]+)', group_input)
                 if match:
                     username = match.group(1)
                     try:
                         entity = await self.client.get_entity(username)
                         return abs(entity.id), entity.title, None
-                    except Exception as e:
-                        logger.error(f"Error getting entity by username: {e}")
+                    except:
                         return None, None, None
             
             # Handle numeric ID
@@ -206,8 +248,7 @@ class SimpleForwarderBot:
                 try:
                     entity = await self.client.get_entity(group_id)
                     return abs(entity.id), entity.title, None
-                except Exception as e:
-                    logger.error(f"Error getting entity by ID: {e}")
+                except:
                     return None, None, None
             
             return None, None, None
@@ -216,123 +257,60 @@ class SimpleForwarderBot:
             logger.error(f"Error extracting group info: {e}")
             return None, None, None
     
-    async def join_private_group(self, invite_hash: str) -> Tuple[bool, str, Optional[int]]:
-        """
-        Join a private group using invite hash
-        Returns: (success, message, chat_id)
-        """
-        try:
-            # Check invite first
-            invite = await self.client(CheckChatInviteRequest(invite_hash))
-            
-            if isinstance(invite, types.ChatInviteAlready):
-                return True, f"✅ Already a member of **{invite.chat.title}**", invite.chat.id
-            
-            elif isinstance(invite, types.ChatInvite):
-                # Join the private group
-                try:
-                    result = await self.client(ImportChatInviteRequest(invite_hash))
-                    
-                    # Get chat ID from updates
-                    for update in result.updates:
-                        if hasattr(update, 'chat_id'):
-                            chat_id = update.chat_id
-                            return True, f"✅ Successfully joined **{invite.title}**", chat_id
-                    
-                    return False, "❌ Could not get chat ID after joining", None
-                    
-                except UserAlreadyParticipantError:
-                    # Try to get the chat entity
-                    try:
-                        # Find chat by searching updates
-                        async for dialog in self.client.iter_dialogs():
-                            if dialog.title == invite.title:
-                                return True, f"✅ Already a member of **{invite.title}**", dialog.id
-                    except:
-                        pass
-                    return False, "❌ Already a member but cannot find chat", None
-                
-                except InviteHashExpiredError:
-                    return False, "❌ **Invite link has expired!**", None
-                except InviteHashInvalidError:
-                    return False, "❌ **Invalid invite link!**", None
-                except InviteRequestSentError:
-                    return True, "✅ **Join request sent!** Waiting for admin approval.", None
-                except ChannelsTooMuchError:
-                    return False, "❌ **Bot is in too many groups/channels!**", None
-            
-            return False, "❌ **Invalid invite link!**", None
-            
-        except Exception as e:
-            logger.error(f"Error joining private group: {e}")
-            return False, f"❌ **Error:** {str(e)}", None
-    
     async def verify_group_membership(self, group_input: str) -> Tuple[bool, str, Optional[int], Optional[str]]:
-        """
-        SIMPLIFIED: Only verify bot is a member of the group
-        Returns: (success, message, chat_id, chat_title)
-        """
+        """Verify bot is a member of the group"""
         try:
-            # Extract group info
             chat_id, chat_title, invite_hash = await self.extract_group_info(group_input)
             
             if invite_hash:
-                # It's a private group invite - try to join
-                success, message, joined_chat_id = await self.join_private_group(invite_hash)
-                
-                if not success:
-                    return False, message, None, None
-                
-                if joined_chat_id:
-                    chat_id = joined_chat_id
-                
-                # Get updated chat info
+                # Private group invite
                 try:
-                    if chat_id:
-                        entity = await self.client.get_entity(chat_id)
-                        chat_title = entity.title
-                except:
-                    pass
-                
-                return True, f"✅ **Group verified:** {chat_title or 'Private Group'}", chat_id, chat_title
+                    invite = await self.client(CheckChatInviteRequest(invite_hash))
+                    
+                    if isinstance(invite, types.ChatInviteAlready):
+                        return True, f"✅ Already a member of **{invite.chat.title}**", invite.chat.id, invite.chat.title
+                    
+                    elif isinstance(invite, types.ChatInvite):
+                        try:
+                            result = await self.client(ImportChatInviteRequest(invite_hash))
+                            for update in result.updates:
+                                if hasattr(update, 'chat_id'):
+                                    return True, f"✅ Successfully joined **{invite.title}**", update.chat_id, invite.title
+                        except UserAlreadyParticipantError:
+                            return True, f"✅ Already a member of **{invite.title}**", chat_id, invite.title
+                        except InviteRequestSentError:
+                            return False, "✅ **Join request sent!** Waiting for admin approval.", None, None
+                        except InviteHashExpiredError:
+                            return False, "❌ **Invite link has expired!**", None, None
+                except Exception as e:
+                    logger.error(f"Error joining private group: {e}")
+                    return False, f"❌ **Error:** {str(e)}", None, None
             
             elif chat_id:
-                # It's a public group/channel
+                # Public group/channel
                 try:
-                    # Try to access the chat
                     entity = await self.client.get_entity(chat_id)
                     
-                    # SIMPLIFIED: Just check if we can access it (implicit membership check)
+                    # Check if we're a participant
                     try:
-                        # Quick access test
-                        _ = await self.client.get_entity(chat_id)
-                        
-                        # Try to get basic info
-                        try:
-                            participant = await self.client(GetParticipantRequest(
-                                channel=entity,
-                                participant=await self.client.get_me()
-                            ))
-                            logger.info(f"Bot is participant in {chat_title}")
-                        except:
-                            # Not a participant, try to join if public
-                            if hasattr(entity, 'username') and entity.username:
-                                try:
-                                    await self.client(JoinChannelRequest(entity))
-                                    logger.info(f"Joined public group: {chat_title}")
-                                except Exception as join_error:
-                                    return False, f"❌ **Cannot access group:** {str(join_error)}", None, None
-                            else:
-                                return False, "❌ **Bot is not a member of this private group!**", None, None
-                        
+                        await self.client(GetParticipantRequest(
+                            channel=entity,
+                            participant=await self.client.get_me()
+                        ))
                         return True, f"✅ **Group verified:** {chat_title}", chat_id, chat_title
+                    except UserNotParticipantError:
+                        # Try to join if public
+                        if hasattr(entity, 'username') and entity.username:
+                            try:
+                                await self.client(JoinChannelRequest(entity))
+                                return True, f"✅ **Joined group:** {chat_title}", chat_id, chat_title
+                            except Exception as e:
+                                return False, f"❌ **Cannot join group:** {str(e)}", None, None
+                        else:
+                            return False, "❌ **Bot is not a member of this private group!**", None, None
                     
-                    except Exception as e:
-                        return False, f"❌ **Cannot access group:** {str(e)}", None, None
-                
                 except Exception as e:
-                    logger.error(f"Error accessing group: {e}")
-                    return False, f"❌ **Error:** {str(e)}", None, None
+                    return False, f"❌ **Cannot access group:** {str(e)}", None, None
             
             else:
                 return False, "❌ **Invalid group link or ID!**", None, None
@@ -341,52 +319,54 @@ class SimpleForwarderBot:
             logger.error(f"Error in verify_group_membership: {e}")
             return False, f"❌ **Error:** {str(e)}", None, None
     
+    def store_message_data(self, message: types.Message) -> dict:
+        """Store message data"""
+        message_data = {
+            'id': message.id,
+            'text': message.text or message.message,
+            'media': None,
+            'forward': None,
+            'date': message.date.isoformat() if message.date else None,
+            'entities': message.entities
+        }
+        
+        if message.media:
+            message_data['media'] = {
+                'type': type(message.media).__name__,
+                'id': getattr(message.media, 'id', None),
+            }
+        
+        if message.forward:
+            message_data['forward'] = {
+                'sender_name': getattr(message.forward, 'sender_name', None),
+                'date': message.forward.date.isoformat() if message.forward.date else None,
+            }
+        
+        self.message_store[message.id] = message_data
+        return message_data
+    
     async def forward_message(self, task_data: dict) -> Tuple[bool, str]:
-        """
-        Forward a message to target chat
-        FIXED: Properly handles forwarded messages from user
-        """
+        """Forward a message to target chat"""
         try:
             user_id = task_data['user_id']
             source_msg_id = task_data['source_msg_id']
             target_chat_id = task_data['target_chat_id']
-            target_chat_title = task_data['target_chat_title']
             
-            # Get the message from cache first
-            message = self.message_cache.get(source_msg_id)
+            # Get the original message
+            messages = await self.client.get_messages(user_id, ids=source_msg_id)
+            if not messages:
+                return False, "❌ **Source message not found!**"
             
-            if not message:
-                # Try to get the message from the chat with the user
-                try:
-                    # Get messages from the chat with the user
-                    messages = await self.client.get_messages(user_id, ids=source_msg_id)
-                    if not messages:
-                        return False, "❌ **Source message not found!**"
-                    
-                    message = messages
-                    # Cache it for future use
-                    self.message_cache[source_msg_id] = message
-                    logger.info(f"Cached message {source_msg_id} from user {user_id}")
-                    
-                except Exception as e:
-                    logger.error(f"Error getting message {source_msg_id} from user {user_id}: {e}")
-                    return False, f"❌ **Cannot access source message:** {str(e)}"
-            
-            # Check if it's a forwarded message
-            if message.forward:
-                logger.info(f"Message {source_msg_id} is a forwarded message, forwarding as is...")
-            
-            # Forward the message
+            # Forward with original sender preserved
             await self.client.forward_messages(
                 entity=target_chat_id,
-                messages=message,
-                drop_author=False,
+                messages=messages,
+                drop_author=False,  # Preserve original sender
                 silent=True
             )
             return True, "✅ **Forwarded successfully!**"
         
         except FloodWaitError as e:
-            logger.warning(f"Flood wait: {e.seconds} seconds")
             return False, f"⏳ **Flood wait:** {e.seconds} seconds"
         except ChatWriteForbiddenError:
             return False, "❌ **Bot cannot send messages in this chat!**"
@@ -396,10 +376,7 @@ class SimpleForwarderBot:
     
     # ==================== TASK MANAGEMENT ====================
     async def start_forwarding_task(self, user_id: int, task_data: dict):
-        """
-        Start a forwarding task with interval
-        FIXED: Uses task_data directly for message access
-        """
+        """Start a forwarding task with interval"""
         task_id = task_data['id']
         interval_hours = task_data['interval']
         target_chat_title = task_data['target_chat_title']
@@ -409,103 +386,27 @@ class SimpleForwarderBot:
                 forward_count = 0
                 
                 while True:
-                    # Forward the message using task_data
                     success, result_msg = await self.forward_message(task_data)
                     forward_count += 1
                     
                     if success:
-                        logger.info(f"Task {task_id}: Forward #{forward_count} successful to {target_chat_title}")
+                        logger.info(f"Task {task_id}: Forward #{forward_count} successful")
                         self.data_manager.update_task_last_forward(user_id, task_id)
-                        
-                        # Send success notification for first forward
-                        if forward_count == 1:
-                            try:
-                                await self.client.send_message(
-                                    user_id,
-                                    f"✅ **Task #{task_id} Started Successfully!**\n\n"
-                                    f"**Target:** {target_chat_title}\n"
-                                    f"**First forward completed!**\n"
-                                    f"**Next forward in:** {interval_hours} hour{'s' if interval_hours > 1 else ''}\n\n"
-                                    f"🔄 **Task is now running automatically!**",
-                                    parse_mode='md'
-                                )
-                            except:
-                                pass
                     else:
                         logger.warning(f"Task {task_id}: Forward #{forward_count} failed - {result_msg}")
-                        
-                        # Check if it's a flood wait
-                        if "Flood wait" in result_msg:
-                            try:
-                                wait_time_match = re.search(r'(\d+)', result_msg)
-                                if wait_time_match:
-                                    wait_time = int(wait_time_match.group(1))
-                                    logger.info(f"Task {task_id}: Waiting {wait_time} seconds due to flood limit")
-                                    await asyncio.sleep(wait_time)
-                                    continue
-                            except:
-                                pass
-                        
-                        # Send error notification (but don't stop for single error)
-                        if forward_count == 1:  # Only on first failure
-                            try:
-                                await self.client.send_message(
-                                    user_id,
-                                    f"⚠️ **Task #{task_id} First forward failed:** {result_msg}\n\n"
-                                    f"Will retry after {interval_hours} hours.",
-                                    parse_mode='md'
-                                )
-                            except:
-                                pass
-                        elif forward_count % 5 == 0:  # Periodic error report every 5 failures
-                            try:
-                                await self.client.send_message(
-                                    user_id,
-                                    f"⚠️ **Task #{task_id} Periodic Update:**\n"
-                                    f"**Failed forwards:** {forward_count}\n"
-                                    f"**Last error:** {result_msg}\n\n"
-                                    f"Task continues to run...",
-                                    parse_mode='md'
-                                )
-                            except:
-                                pass
                     
                     # Wait for next interval
-                    logger.info(f"Task {task_id}: Waiting {interval_hours} hours for next forward")
                     await asyncio.sleep(interval_hours * 3600)
                     
             except asyncio.CancelledError:
-                logger.info(f"Task {task_id} cancelled by user")
-                try:
-                    await self.client.send_message(
-                        user_id,
-                        f"🛑 **Task #{task_id} has been stopped by user request.**",
-                        parse_mode='md'
-                    )
-                except:
-                    pass
+                logger.info(f"Task {task_id} cancelled")
             except Exception as e:
                 logger.error(f"Task {task_id} error: {e}")
-                try:
-                    await self.client.send_message(
-                        user_id,
-                        f"❌ **Task #{task_id} Crashed:** {str(e)}\n\n"
-                        f"🛑 **Task has been stopped!**",
-                        parse_mode='md'
-                    )
-                except:
-                    pass
-                finally:
-                    # Remove task from active tasks
-                    if task_id in self.active_tasks:
-                        del self.active_tasks[task_id]
         
         # Create and store the task
         task = asyncio.create_task(task_loop())
         self.active_tasks[task_id] = task
-        
         logger.info(f"Started task {task_id} for user {user_id}")
-        return task_id
     
     async def stop_task_by_id(self, user_id: int, task_id: int) -> bool:
         """Stop a specific forwarding task"""
@@ -534,45 +435,32 @@ class SimpleForwarderBot:
         # Clear any existing state
         self.data_manager.clear_user_state(user_id)
         
-        # Send welcome message
         welcome_text = """
-🤖 **Welcome to Simple Auto-Forwarder Bot!** 🤖
+🤖 **Welcome to Private Auto-Forwarder Bot!** 🤖
 
 📌 **I will forward your messages automatically** with interval control.
 
-🔹 **Simple & Effective:**
-✅ Pure forwarding (no modification)
+🔹 **Features:**
+✅ **Private Chat Only** - Works only in private messages
+✅ **No Repeated Messages** - Clean interface
+✅ **Preserves original sender** in forwarded messages
 ✅ 1-6 hours interval
 ✅ **Private group support** (via invite links)
-✅ **No complex permission checks**
-✅ **Handles forwarded messages perfectly**
-✅ Robust error handling
 ✅ **Local data storage only**
 
-📝 **How to use:**
-1️⃣ Send **target group/channel** (link, ID, or private invite)
-2️⃣ **Forward any message** to me (text, photo, video, etc.)
-3️⃣ Choose **interval** (1-6 hours)
-
-🛠 **Supported Inputs:**
-• Public group links: `https://t.me/groupname`
-• Private group invites: `https://t.me/+invitehash`
-• Channel links
-• Group/Channel IDs
-
 ⚠️ **Important:** 
-• Bot must be **added to group** as admin
+• **I only work in private chats** (not in groups)
+• Bot must be **added to target group** as admin
 • Bot needs **'Access to Messages'** permission
-• **Never modifies** your content - forwards exactly as is
-• **Auto-joins** private groups from invites
-• **Perfect for forwarded messages!**
+• **Never modifies** your content
 
 **Commands:**
-/cancel - Cancel current operation
+/start - Begin new task
 /mytasks - View your tasks
 /stoptask_1 - Stop task #1
 /status - Check bot status
-/help - Show this help
+/help - Show help
+/cancel - Cancel current operation
 
 🚀 **Let's get started!**
 
@@ -580,8 +468,6 @@ class SimpleForwarderBot:
         """
         
         await event.reply(welcome_text, parse_mode='md')
-        
-        # Set initial state
         self.data_manager.set_user_state(user_id, {'step': 'awaiting_group'})
     
     async def handle_cancel(self, event):
@@ -600,7 +486,6 @@ class SimpleForwarderBot:
             return
         
         tasks_text = "📋 **Your Active Tasks:**\n\n"
-        active_count = 0
         
         for task in tasks:
             task_id = task.get('id', 'N/A')
@@ -608,26 +493,17 @@ class SimpleForwarderBot:
             target = task.get('target_chat_title', 'Unknown')
             created = task.get('created_at', 'Unknown')[:10]
             status = task.get('status', 'active')
-            last_forward = task.get('last_forward', 'Never')
             forward_count = task.get('forward_count', 0)
             
-            if isinstance(last_forward, str) and len(last_forward) > 10:
-                last_forward = last_forward[:10]
-            
             status_emoji = "🟢" if status == 'active' else "🔴"
-            if status == 'active':
-                active_count += 1
             
             tasks_text += f"**Task #{task_id}** {status_emoji}\n"
             tasks_text += f"• **Target:** {target}\n"
             tasks_text += f"• **Interval:** {interval} hour{'s' if interval > 1 else ''}\n"
             tasks_text += f"• **Created:** {created}\n"
-            tasks_text += f"• **Last Forward:** {last_forward}\n"
-            tasks_text += f"• **Total Forwards:** {forward_count}\n"
-            tasks_text += f"• **Status:** {status.title()}\n"
+            tasks_text += f"• **Forwards:** {forward_count}\n"
             tasks_text += f"• **Stop:** `/stoptask_{task_id}`\n\n"
         
-        tasks_text += f"📊 **Total Active Tasks:** {active_count}\n"
         tasks_text += "🛑 **To stop a task:** Use `/stoptask_1` (replace 1 with task number)"
         
         await event.reply(tasks_text, parse_mode='md')
@@ -637,36 +513,25 @@ class SimpleForwarderBot:
         user_id = event.sender_id
         command = event.raw_text
         
-        # Extract task ID from command
         if '_' in command:
             try:
                 task_id = int(command.split('_')[1])
+                stopped = await self.stop_task_by_id(user_id, task_id)
+                if stopped:
+                    await event.reply(f"✅ **Task #{task_id} has been stopped!**", parse_mode='md')
+                else:
+                    await event.reply(f"❌ **Task #{task_id} not found or already stopped!**", parse_mode='md')
             except:
-                await event.reply("❌ **Invalid task ID!**\n\nUse `/stoptask_1` (replace 1 with your task number)", parse_mode='md')
-                return
+                await event.reply("❌ **Invalid task ID!**", parse_mode='md')
         else:
-            await event.reply("❌ **Please specify task ID!**\n\nUse `/stoptask_1` (replace 1 with your task number)", parse_mode='md')
-            return
-        
-        # Stop the task
-        stopped = await self.stop_task_by_id(user_id, task_id)
-        
-        if stopped:
-            await event.reply(f"✅ **Task #{task_id} has been stopped!**", parse_mode='md')
-        else:
-            await event.reply(f"❌ **Task #{task_id} not found or already stopped!**", parse_mode='md')
+            await event.reply("❌ **Please specify task ID!**\n\nUse `/stoptask_1`", parse_mode='md')
     
     async def handle_status(self, event):
         """Handle /status command"""
         user_id = event.sender_id
-        
-        # Get bot info
         me = await self.client.get_me()
-        
-        # Get tasks info
         tasks = self.data_manager.get_user_tasks(user_id)
         active_tasks = sum(1 for task in tasks if task.get('status') == 'active')
-        total_forwards = sum(task.get('forward_count', 0) for task in tasks)
         
         status_text = f"""
 🤖 **Bot Status Report**
@@ -675,26 +540,16 @@ class SimpleForwarderBot:
 • **Name:** @{me.username or me.first_name}
 • **ID:** {me.id}
 • **Status:** 🟢 **Online**
-• **Message Cache:** {len(self.message_cache)} messages
+• **Mode:** Private Chat Only
 
 **Your Tasks:**
 • **Total Tasks:** {len(tasks)}
 • **Active Tasks:** {active_tasks}
-• **Total Forwards:** {total_forwards}
-• **Active Forwarders:** {len(self.active_tasks)}
 
-**System Info:**
-• **Storage:** Local JSON file
-• **Session:** {SESSION_FILE}
-• **Log File:** {LOG_FILE}
-• **Data File:** {DATA_FILE}
-
-**Commands Available:**
-• /start - Start new task
-• /mytasks - View tasks
-• /stoptask_1 - Stop task
-• /status - This status
-• /help - Show help
+**Bot Restrictions:**
+✅ Only works in private chats
+✅ No repeated messages
+✅ Clean interface
 
 ✅ **Bot is running normally!**
         """
@@ -704,71 +559,49 @@ class SimpleForwarderBot:
     async def handle_help(self, event):
         """Handle /help command"""
         help_text = """
-🆘 **Auto-Forwarder Bot Help**
+🆘 **Private Auto-Forwarder Bot Help**
+
+**Important: This bot only works in private messages!**
 
 **Quick Start:**
-1. Add bot to your group as **Admin**
-2. Grant **"Access to Messages"** permission
-3. Use `/start` to begin setup
+1. **Message me privately** (not in a group)
+2. Use `/start` command
+3. Send group/channel link or ID
+4. Forward your message
+5. Choose interval (1-6 hours)
 
-**How to forward messages:**
-1. Use `/start` command
-2. Send group/channel link or ID
-3. **Forward any message** to the bot
-4. Choose interval (1-6 hours)
+**Why Private Only?**
+• Prevents spam in groups
+• Cleaner interface
+• Better user experience
+• No repeated messages
 
-**Supported Message Types:**
-✅ Text messages
-✅ Photos & Videos
-✅ Documents & Files
-✅ **Forwarded messages** (keeps original sender info)
-✅ Stickers & GIFs
-✅ Voice messages
-
-**Commands:**
+**Commands (Private Chat Only):**
 • `/start` - Begin new forwarding task
 • `/mytasks` - View all your tasks
 • `/stoptask_1` - Stop task #1
 • `/status` - Check bot status
-• `/cancel` - Cancel current operation
 • `/help` - Show this help
+• `/cancel` - Cancel current operation
 
-**Troubleshooting:**
-• **Bot not forwarding?** Ensure bot has "Access to Messages"
-• **Permission errors?** Bot must be group admin
-• **Private groups?** Use invite link format: t.me/+abc123
-• **Forwarded messages work perfectly!**
-
-**Important Notes:**
-• Bot only **FORWARDS** - never modifies content
-• **Keeps original sender info** in forwarded messages
-• All data stored **locally** on your machine
-• Works 24/7 when bot is running
-• Handles flood limits automatically
-
-Need more help? Contact the bot administrator.
+**Need help in a group?** Message me privately instead!
         """
         
         await event.reply(help_text, parse_mode='md')
     
     async def handle_message(self, event):
-        """Handle all incoming messages"""
+        """Handle all incoming messages (already filtered for private chat)"""
         user_id = event.sender_id
-        
-        # Ignore commands
-        if event.raw_text and event.raw_text.startswith('/'):
-            return
         
         # Get user state
         state = self.data_manager.get_user_state(user_id)
         
         if not state:
-            # User not in any state, send instructions
+            # User not in setup, send minimal response
             await event.reply(
-                "👋 **Hello! I'm Simple Auto-Forwarder Bot!** 🤖\n\n"
-                "I forward messages automatically with your chosen interval.\n\n"
-                "**Perfect for forwarding messages!** ✅\n\n"
-                "Type /start to begin or /help for instructions.",
+                "👋 **Hello! I'm Private Auto-Forwarder Bot!**\n\n"
+                "I only work in private messages.\n\n"
+                "Use /start to begin or /help for instructions.",
                 parse_mode='md'
             )
             return
@@ -776,20 +609,15 @@ Need more help? Contact the bot administrator.
         current_step = state.get('step')
         
         if current_step == 'awaiting_group':
-            # Step 1: Get target group/channel
             group_input = event.raw_text.strip()
-            
-            # Show processing message
             processing_msg = await event.reply("🔍 **Verifying group access...**", parse_mode='md')
             
-            # SIMPLIFIED: Just verify group membership/access
             success, message, chat_id, chat_title = await self.verify_group_membership(group_input)
             
             if not success:
-                await processing_msg.edit(f"{message}\n\nPlease check the group link and ensure bot is added as admin.")
+                await processing_msg.edit(message)
                 return
             
-            # Store group info
             state.update({
                 'step': 'awaiting_message',
                 'target_chat_id': chat_id,
@@ -798,81 +626,43 @@ Need more help? Contact the bot administrator.
             self.data_manager.set_user_state(user_id, state)
             
             await processing_msg.edit(
-                f"✅ **Perfect!** Target set to: **{chat_title or 'Private Group'}**\n\n"
-                f"📝 **Step 2:** Now **forward any message** to me that you want to auto-forward.\n\n"
-                f"💡 **Tip:** You can forward:\n"
-                f"• Text messages\n"
-                f"• Photos & Videos\n"
-                f"• Documents\n"
-                f"• **Any forwarded message** (keeps original info)\n\n"
-                f"⚠️ **Important:** I will forward **exactly** what you send, keeping all original information!",
+                f"✅ **Target set to:** {chat_title or 'Private Group'}\n\n"
+                f"📝 **Step 2:** Forward me the message you want to auto-forward.\n\n"
+                f"💡 **Tip:** Forward it (don't copy) to preserve original sender info.",
                 parse_mode='md'
             )
         
         elif current_step == 'awaiting_message':
-            # Step 2: Get message to forward
             if not event.message:
-                await event.reply(
-                    "❌ **Please send or forward a message!**\n\n"
-                    "It can be text, photo, video, document, or any forwarded message.",
-                    parse_mode='md'
-                )
+                await event.reply("❌ **Please forward a message to me!**", parse_mode='md')
                 return
             
-            # Store the message ID and cache it immediately
-            message_id = event.message.id
-            self.message_cache[message_id] = event.message
-            
-            # Check if it's a forwarded message
-            if event.message.forward:
-                logger.info(f"User {user_id} forwarded message {message_id} from {event.message.forward.sender_id}")
-            
-            # Store the message info
+            # Store message
+            message_data = self.store_message_data(event.message)
             state['step'] = 'awaiting_interval'
-            state['source_msg_id'] = message_id
-            state['message_cached'] = True
+            state['source_msg_id'] = event.message.id
             self.data_manager.set_user_state(user_id, state)
             
             # Create buttons for interval selection
             buttons = [
-                [Button.inline("⏰ 1 Hour", b"int_1"),
-                 Button.inline("⏰ 2 Hours", b"int_2"),
-                 Button.inline("⏰ 3 Hours", b"int_3")],
-                [Button.inline("⏰ 4 Hours", b"int_4"),
-                 Button.inline("⏰ 5 Hours", b"int_5"),
-                 Button.inline("⏰ 6 Hours", b"int_6")]
+                [Button.inline("1️⃣ 1 Hour", b"int_1"),
+                 Button.inline("2️⃣ 2 Hours", b"int_2"),
+                 Button.inline("3️⃣ 3 Hours", b"int_3")],
+                [Button.inline("4️⃣ 4 Hours", b"int_4"),
+                 Button.inline("5️⃣ 5 Hours", b"int_5"),
+                 Button.inline("6️⃣ 6 Hours", b"int_6")]
             ]
             
-            # Show message preview
-            message_preview = "📨 **Message received!** "
-            if event.message.text:
-                preview_text = event.message.text[:50] + "..." if len(event.message.text) > 50 else event.message.text
-                message_preview += f"Text: `{preview_text}`"
-            elif event.message.photo:
-                message_preview += "📷 Photo"
-            elif event.message.video:
-                message_preview += "🎬 Video"
-            elif event.message.document:
-                message_preview += "📄 Document"
-            elif event.message.forward:
-                message_preview += "🔄 Forwarded Message"
-            else:
-                message_preview += "Media Message"
-            
             await event.reply(
-                f"{message_preview}\n\n"
-                f"⏰ **Step 3:** Choose forwarding interval:\n\n"
-                f"**How often should I forward this message?**\n"
-                f"Select from 1 to 6 hours:",
+                f"✅ **Message received!**\n\n"
+                f"⏰ **Step 3:** Choose forwarding interval:",
                 buttons=buttons,
                 parse_mode='md'
             )
         
         elif current_step == 'awaiting_interval':
-            # Should be handled by button callback
             await event.reply(
-                "⏰ **Please select interval using the buttons above!**\n\n"
-                "If buttons are missing, type /start to begin again.",
+                "⏰ **Please select interval using the buttons above!**",
                 parse_mode='md'
             )
     
@@ -881,11 +671,9 @@ Need more help? Contact the bot administrator.
         user_id = event.sender_id
         data = event.data.decode()
         
-        # Get user state
         state = self.data_manager.get_user_state(user_id)
-        
         if not state or state.get('step') != 'awaiting_interval':
-            await event.answer("Session expired. Please type /start to begin again.")
+            await event.answer("Session expired. Type /start to begin again.")
             await event.delete()
             return
         
@@ -893,7 +681,6 @@ Need more help? Contact the bot administrator.
             interval = int(data[4:])
             
             if 1 <= interval <= 6:
-                # Complete the setup
                 task_data = {
                     'user_id': user_id,
                     'target_chat_id': state['target_chat_id'],
@@ -903,55 +690,29 @@ Need more help? Contact the bot administrator.
                     'status': 'active'
                 }
                 
-                # Add task to database
                 task_id = self.data_manager.add_forwarding_task(user_id, task_data)
-                
-                # Start the forwarding task
                 await self.start_forwarding_task(user_id, task_data)
-                
-                # Clear user state
                 self.data_manager.clear_user_state(user_id)
                 
-                # Send confirmation
                 confirmation_text = f"""
-🎉 **Auto-Forwarding Setup Complete!** 🎉
+🎉 **Auto-Forwarding Setup Complete!**
 
 ✅ **Target:** {state['target_chat_title']}
 ✅ **Interval:** Every {interval} hour{'s' if interval > 1 else ''}
 ✅ **Task ID:** #{task_id}
 ✅ **Status:** 🟢 **ACTIVE**
 
-📤 **I will now automatically forward your message** to the target group/channel.
+📤 **Forwarding will start immediately.**
 
-🔄 **First forward will happen immediately**, then every {interval} hour{'s' if interval > 1 else ''}.
-
-📋 **View your tasks:** /mytasks
-🛑 **Stop this task:** `/stoptask_{task_id}`
-📊 **Check status:** /status
-🆕 **Create new task:** /start
-
-💾 **Data stored locally** - No third-party clouds!
-
-⚠️ **Note:** Ensure bot remains running in background for continuous forwarding.
+📋 **View tasks:** /mytasks
+🛑 **Stop task:** `/stoptask_{task_id}`
                 """
                 
                 await event.edit(confirmation_text, parse_mode='md')
-                
-                # Do initial forward immediately
-                try:
-                    success, result_msg = await self.forward_message(task_data)
-                    if success:
-                        await asyncio.sleep(1)
-                        await event.reply(f"✅ **Initial forward successful!**\n\nNext forward in {interval} hour{'s' if interval > 1 else ''}.", parse_mode='md')
-                    else:
-                        await event.reply(f"⚠️ **Initial forward attempt:** {result_msg}\n\nWill retry in {interval} hours.", parse_mode='md')
-                except Exception as e:
-                    await event.reply(f"⚠️ **Initial forward error:** {str(e)}\n\nTask will continue with scheduled intervals.", parse_mode='md')
     
     # ==================== BOT LIFECYCLE ====================
     async def start(self):
         """Start the bot"""
-        # Connect to Telegram
         await self.client.start(bot_token=self.bot_token)
         
         # Add callback handler
@@ -963,37 +724,15 @@ Need more help? Contact the bot administrator.
         # Load existing tasks
         await self.load_existing_tasks()
         
-        # Get bot info
         me = await self.client.get_me()
-        logger.info(f"🤖 Simple Bot started as @{me.username}")
-        logger.info(f"📱 User ID: {me.id}")
-        logger.info(f"🔑 Session: {SESSION_FILE}")
-        
-        # Send startup notification
-        try:
-            await self.client.send_message(
-                'me',
-                f"✅ **Simple Auto-Forwarder Bot Started!**\n\n"
-                f"🤖 **Bot:** @{me.username}\n"
-                f"🆔 **ID:** {me.id}\n"
-                f"📅 **Started:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"💾 **Session:** {SESSION_FILE}\n"
-                f"📊 **Data File:** {DATA_FILE}\n"
-                f"🔄 **Message Cache:** {len(self.message_cache)} messages\n\n"
-                f"🚀 **Ready to forward messages!**\n"
-                f"✅ **Perfect for forwarded messages!**",
-                parse_mode='md'
-            )
-        except Exception as e:
-            logger.warning(f"Could not send startup message: {e}")
+        logger.info(f"🤖 Private Bot started as @{me.username}")
         
         # Keep running
         await self.client.run_until_disconnected()
     
     async def load_existing_tasks(self):
-        """Load and restart existing tasks from storage"""
+        """Load and restart existing tasks"""
         tasks_data = self.data_manager.data.get('tasks', {})
-        loaded_count = 0
         
         for user_id_str, tasks in tasks_data.items():
             user_id = int(user_id_str)
@@ -1001,60 +740,235 @@ Need more help? Contact the bot administrator.
                 if task.get('status') == 'active':
                     try:
                         await self.start_forwarding_task(user_id, task)
-                        loaded_count += 1
-                        logger.info(f"Restarted task {task['id']} for user {user_id}")
                     except Exception as e:
                         logger.error(f"Error restarting task {task['id']}: {e}")
-        
-        if loaded_count > 0:
-            logger.info(f"Loaded {loaded_count} existing tasks")
     
     async def stop(self):
         """Stop the bot gracefully"""
-        # Cancel all active tasks
         for task_id, task in self.active_tasks.items():
             task.cancel()
-        
-        # Save data
         self.data_manager.save_data()
+
+# ==================== FLASK WEB SERVER FOR REPLIT ====================
+from flask import Flask, render_template_string
+
+app = Flask(__name__)
+bot_instance = None
+
+# Simple HTML template for Replit
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Telegram Auto-Forwarder Bot</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            color: white;
+        }
+        .container {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        h1 {
+            text-align: center;
+            margin-bottom: 30px;
+            color: white;
+            font-size: 2.5em;
+        }
+        .status {
+            background: rgba(0, 255, 0, 0.2);
+            padding: 15px;
+            border-radius: 10px;
+            margin: 20px 0;
+            text-align: center;
+            font-weight: bold;
+            border: 2px solid rgba(0, 255, 0, 0.5);
+        }
+        .info-box {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 20px;
+            border-radius: 10px;
+            margin: 20px 0;
+        }
+        .feature-list {
+            list-style: none;
+            padding: 0;
+        }
+        .feature-list li {
+            padding: 10px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        .feature-list li:before {
+            content: "✓ ";
+            color: #4CAF50;
+            font-weight: bold;
+        }
+        .instructions {
+            background: rgba(0, 0, 0, 0.2);
+            padding: 25px;
+            border-radius: 15px;
+            margin: 25px 0;
+        }
+        .telegram-link {
+            display: inline-block;
+            background: #0088cc;
+            color: white;
+            padding: 15px 30px;
+            text-decoration: none;
+            border-radius: 50px;
+            font-weight: bold;
+            margin-top: 20px;
+            transition: all 0.3s;
+        }
+        .telegram-link:hover {
+            background: #006699;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3);
+        }
+        .footer {
+            text-align: center;
+            margin-top: 40px;
+            font-size: 0.9em;
+            opacity: 0.8;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🤖 Telegram Auto-Forwarder Bot</h1>
         
-        logger.info(f"Bot stopped. Active tasks cancelled: {len(self.active_tasks)}")
+        <div class="status">
+            🟢 Bot Status: <strong>ONLINE</strong>
+        </div>
+        
+        <div class="info-box">
+            <h2>🎯 Key Features:</h2>
+            <ul class="feature-list">
+                <li><strong>Private Chat Only</strong> - Works only in private messages</li>
+                <li><strong>No Repeated Messages</strong> - Clean interface</li>
+                <li><strong>Preserves Original Sender</strong> in forwarded messages</li>
+                <li><strong>Interval Control</strong> - 1 to 6 hours</li>
+                <li><strong>Private Group Support</strong> via invite links</li>
+                <li><strong>Local Data Storage</strong> - No third-party clouds</li>
+                <li><strong>Auto-Join</strong> private groups</li>
+                <li><strong>Error Handling</strong> with automatic retry</li>
+            </ul>
+        </div>
+        
+        <div class="instructions">
+            <h2>📱 How to Use:</h2>
+            <ol>
+                <li><strong>Message the bot privately</strong> (not in groups)</li>
+                <li>Use <code>/start</code> command</li>
+                <li>Send target group/channel link or ID</li>
+                <li>Forward your message to the bot</li>
+                <li>Choose interval (1-6 hours)</li>
+                <li>Done! Bot will forward automatically</li>
+            </ol>
+            
+            <div style="text-align: center;">
+                <a href="https://t.me/{{ bot_username }}" class="telegram-link" target="_blank">
+                    🚀 Start Chatting with Bot
+                </a>
+            </div>
+        </div>
+        
+        <div class="info-box">
+            <h2>⚙️ Bot Commands:</h2>
+            <p><code>/start</code> - Begin new forwarding task</p>
+            <p><code>/mytasks</code> - View your active tasks</p>
+            <p><code>/stoptask_1</code> - Stop specific task</p>
+            <p><code>/status</code> - Check bot status</p>
+            <p><code>/help</code> - Show help instructions</p>
+            <p><code>/cancel</code> - Cancel current operation</p>
+        </div>
+        
+        <div class="footer">
+            <p>🤖 Auto-Forwarder Bot | Made with ❤️ for Telegram</p>
+            <p>⚠️ Important: Bot only works in private chats!</p>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+@app.route('/')
+def home():
+    """Home page for Replit deployment"""
+    bot_username = "YourBotUsername"  # Will be replaced with actual username
+    if bot_instance and bot_instance.client.is_connected():
+        try:
+            me = bot_instance.client.loop.run_until_complete(bot_instance.client.get_me())
+            bot_username = me.username or "auto_forwarder_bot"
+        except:
+            pass
+    
+    return render_template_string(HTML_TEMPLATE, bot_username=bot_username)
+
+@app.route('/health')
+def health():
+    """Health check endpoint for monitoring"""
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 # ==================== MAIN ENTRY POINT ====================
-async def main():
-    """Main function to run the bot"""
+async def run_bot():
+    """Run the Telegram bot"""
+    global bot_instance
     
     print("\n" + "="*60)
-    print("🤖 SIMPLE AUTO-FORWARDER BOT")
+    print("🤖 PRIVATE AUTO-FORWARDER BOT")
     print("="*60)
     
-    # Create and start bot
-    bot = SimpleForwarderBot(API_ID, API_HASH, BOT_TOKEN)
+    bot_instance = PrivateChatOnlyBot(API_ID, API_HASH, BOT_TOKEN)
     
     try:
         print(f"🔄 Starting bot with API ID: {API_ID}")
         print(f"🔐 Session file: {SESSION_FILE}")
         print(f"💾 Data file: {DATA_FILE}")
-        print(f"📝 Log file: {LOG_FILE}")
         print("="*60)
-        print("🚀 Bot is starting... (Press Ctrl+C to stop)")
-        print("✅ **Perfect for forwarding messages!**")
+        print("✅ **Private Chat Only Mode**")
+        print("✅ **No Repeated Messages**")
+        print("✅ **Flask Web Interface**")
+        print("="*60)
+        print("🚀 Bot is starting...")
         
-        await bot.start()
+        await bot_instance.start()
     except KeyboardInterrupt:
-        print("\n⚠️ Received interrupt signal - Stopping bot...")
-        logger.info("Received keyboard interrupt")
+        print("\n⚠️ Stopping bot...")
     except Exception as e:
         print(f"\n❌ Bot crashed: {e}")
         logger.error(f"Bot crashed: {e}", exc_info=True)
     finally:
-        await bot.stop()
+        await bot_instance.stop()
         print("\n✅ Bot stopped gracefully")
-        print("="*60)
+
+def run_flask():
+    """Run Flask web server"""
+    port = int(os.environ.get('PORT', 5000))
+    print(f"🌐 Starting Flask web server on port {port}")
+    app.run(host='0.0.0.0', port=port)
 
 if __name__ == '__main__':
     # Create data directory if it doesn't exist
     Path(DATA_FILE).parent.mkdir(parents=True, exist_ok=True)
     
-    # Run the bot
-    asyncio.run(main())
+    # Run both bot and web server concurrently
+    import threading
+    
+    # Start Flask in a separate thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    
+    # Run the bot in main thread
+    asyncio.run(run_bot())
