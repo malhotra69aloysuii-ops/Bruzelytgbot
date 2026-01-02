@@ -1,6 +1,8 @@
 telethon==1.37.0
+Flask==3.0.0
 pysocks==1.7.1
 cryptg==0.4.0
 pyasn1==0.6.0
 pyasn1-modules==0.4.0
 rsa==4.9
+gunicorn==21.2.0
